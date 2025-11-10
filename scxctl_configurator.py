@@ -225,7 +225,7 @@ class SchedulerSelector(QWidget):
 
             if output:
                 scheduler_name = output.strip()
-                return f"Scheduler Status: RUNNING ({scheduler_name.upper()})", output
+                return f"Scheduler Status: {scheduler_name.upper()}", output
 
             return "Scheduler Status: Status Unknown (Empty Output)", output
 
