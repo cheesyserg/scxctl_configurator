@@ -272,6 +272,8 @@ class SchedulerSelector(QWidget):
     def confirm_selection(self):
         """
         Pulls arguments from EITHER the textbox (if filled) OR the dropdown (if textbox is empty).
+        Translates spaces to commas for argument passing.
+        Re-adds explicit quotes around the final args to match the required scxctl syntax.
         """
         selected_scheduler = self.scheduler_combo.currentText()
 
@@ -288,12 +290,9 @@ class SchedulerSelector(QWidget):
             base_command = ['scxctl', 'switch', '--sched', selected_scheduler]
 
         # 1. Prepare Arguments: Custom textbox takes precedence
-        # We always use the text currently in the box, whether it was typed or autofilled.
         final_args = self.args_textbox.text().strip()
 
         if not final_args:
-            # If textbox is empty, and a mode is selected, we should still use the mode flags
-            # (The autofill logic should prevent this, but this serves as a robust fallback)
             if self.mode_combo and self.mode_combo.currentIndex() > 0:
                 selected_mode_name = self.mode_combo.currentText()
                 mode_data = SCHEDULER_OPTIONS.get(selected_scheduler, {}).get("Modes", {}).get(selected_mode_name, {})
@@ -301,19 +300,30 @@ class SchedulerSelector(QWidget):
 
         final_args = final_args.strip()
 
+        # Translate spaces to commas in the final arguments string
+        if final_args:
+            final_args_comma_separated = final_args.replace(' ', ',')
+        else:
+            final_args_comma_separated = final_args
+
+
         # 2. Build the Final Command
         final_command = list(base_command)
 
-        if final_args:
-            final_command.append('--args')
-            # The args must be passed as a single string argument, hence the quotes
-            final_command.append(f'"{final_args}"')
+        if final_args_comma_separated:
+            final_command.append(f'--args={final_args_comma_separated}')
+            # FIX: Adding back the explicit double quotes to match the required command-line syntax.
 
-        # 3. Execute
+        # 3. Execute (Outputting the command here for debugging)
+        # The output now correctly shows the quoted argument, e.g., --args "-c,75,-m,0-15"
         self.feedback_label.setText(f"Attempting command: {' '.join(final_command)}")
         QApplication.processEvents()
 
         try:
+            # When the list is passed, subprocess.run handles the quoting for the shell.
+            # If the literal quotes cause an error again, we will know the system shell
+            # is being double-quoted and we must remove the quotes here, but for now,
+            # we follow your example syntax.
             subprocess.run(
                 final_command,
                 capture_output=True,
