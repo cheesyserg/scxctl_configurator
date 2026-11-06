@@ -5,9 +5,13 @@ Presets are intentionally not bundled: the modes and arguments shown here come
 from scx_loader's own configuration, queried via `scxctl modes --show-args`.
 """
 
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QKeySequence
@@ -29,10 +33,19 @@ from PySide6.QtWidgets import (
 
 SCXCTL = "scxctl"
 NO_MODE = "Default (no mode)"
+BOOT_UNIT = "scx-profile.service"
+BOOT_UNIT_FILE = Path("/etc/systemd/system") / BOOT_UNIT
+SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
+JOURNALCTL = shutil.which("journalctl") or "/usr/bin/journalctl"
+SHELL = shutil.which("sh") or "/bin/sh"
 
 # Lines such as "Modes:" or "Modes for bpfland:" are headers, not mode names.
 _HEADER_RE = re.compile(r"^(?:modes?|configured|available|args?|arguments|scheduler|supported)\b", re.I)
 _BULLET_RE = re.compile(r"^[-*\u2022]\s*")
+_AUTH_RE = re.compile(
+    r"authentication|password|not authorized|request dismissed|access denied|permission denied",
+    re.I,
+)
 
 
 class ScxctlError(RuntimeError):
@@ -76,6 +89,137 @@ def parse_modes(text):
     return modes
 
 
+def _result_message(result):
+    return (result.stderr or result.stdout or "").strip()
+
+
+def _combined_message(result):
+    parts = [part.strip() for part in (result.stderr, result.stdout) if part and part.strip()]
+    return "\n".join(parts)
+
+
+def _systemd_quote(value):
+    if value and not re.search(r"[\s\"'\\]", value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def boot_unit_text(scheduler, args):
+    """Build a oneshot unit that applies scheduler/profile at boot."""
+    binary = shutil.which(SCXCTL)
+    if not binary:
+        raise ScxctlError(f"'{SCXCTL}' was not found on PATH.")
+
+    exec_args = [binary, "start", "--sched", scheduler]
+    if args:
+        # scxctl rejects "--args VALUE" when VALUE starts with "-", so keep
+        # the whole thing in one argv token.
+        exec_args.append(f"--args={args}")
+    exec_line = " ".join(_systemd_quote(arg) for arg in exec_args)
+    binary = _systemd_quote(binary)
+    return (
+        "[Unit]\n"
+        "Description=Apply the configured scx scheduler at boot\n"
+        "After=scx_loader.service dbus.service\n"
+        "Wants=scx_loader.service\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        f"ExecStartPre=-{binary} stop\n"
+        f"ExecStart={exec_line}\n"
+        f"ExecStop=-{binary} stop\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    )
+
+
+def _run_root_script(script, timeout=120):
+    """Run a shell snippet as root, using pkexec/sudo when needed."""
+    if os.geteuid() == 0:
+        result = subprocess.run(
+            [SHELL, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ScxctlError(_combined_message(result) or "Command failed.")
+        return
+
+    errors = []
+    last_result = None
+    prefixes = [["pkexec"], ["sudo", "-n"]]
+    if sys.stdin is not None and sys.stdin.isatty():
+        prefixes.append(["sudo"])
+
+    for prefix in prefixes:
+        if shutil.which(prefix[0]) is None:
+            continue
+        try:
+            result = subprocess.run(
+                [*prefix, SHELL, "-c", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=timeout,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc))
+            continue
+        if result.returncode == 0:
+            return
+        last_result = result
+        errors.append(_combined_message(result))
+
+    if last_result is not None:
+        # The command did run; a non-zero exit is usually the command's own
+        # failure, but surface an authentication hint when that is the cause.
+        detail = _combined_message(last_result) or "Command failed."
+        if _AUTH_RE.search(detail):
+            raise ScxctlError(
+                f"Could not run the systemd command as root ({detail}). "
+                "Run the configurator from a terminal with sudo once."
+            )
+        raise ScxctlError(detail)
+
+    detail = next((error for error in errors if error), "authentication failed")
+    raise ScxctlError(
+        f"Could not run the systemd command as root ({detail}). "
+        "Run the configurator from a terminal with sudo once."
+    )
+
+
+def install_boot_unit(content):
+    path = shlex.quote(str(BOOT_UNIT_FILE))
+    unit = shlex.quote(BOOT_UNIT)
+    systemctl = shlex.quote(SYSTEMCTL)
+    script = (
+        f"printf %s {shlex.quote(content)} > {path} && "
+        f"chmod 644 {path} && "
+        f"{systemctl} daemon-reload && "
+        f"{systemctl} enable {unit} && "
+        f"{systemctl} restart {unit} || {{ "
+        f"{systemctl} --no-pager --full status {unit}; "
+        f"{shlex.quote(JOURNALCTL)} -xeu {unit} -n 20 --no-pager; exit 1; }}"
+    )
+    _run_root_script(script)
+
+
+def remove_boot_unit():
+    path = shlex.quote(str(BOOT_UNIT_FILE))
+    script = (
+        f"{shlex.quote(SYSTEMCTL)} disable --now {shlex.quote(BOOT_UNIT)} || true; "
+        f"rm -f {path} && "
+        f"{shlex.quote(SYSTEMCTL)} daemon-reload"
+    )
+    _run_root_script(script)
+
+
 class Scxctl:
     """Thin wrapper around the scxctl CLI."""
 
@@ -95,7 +239,7 @@ class Scxctl:
 
     @staticmethod
     def _message(result):
-        return (result.stderr or result.stdout or "").strip()
+        return _result_message(result)
 
     def schedulers(self):
         result = self.run("list")
@@ -211,6 +355,10 @@ class Configurator(QWidget):
         status_row.addWidget(self.status_icon)
         status_row.addWidget(self.status_text, 1)
 
+        self.boot_label = QLabel("At boot: checking\u2026")
+        self.boot_label.setWordWrap(True)
+        self.boot_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.message_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -218,6 +366,17 @@ class Configurator(QWidget):
 
         self.stop_button = QPushButton(self._icon("process-stop", QStyle.StandardPixmap.SP_MediaStop), "Stop")
         self.stop_button.clicked.connect(self.stop)
+
+        self.boot_button = QPushButton("Set at boot")
+        self.boot_button.setToolTip(
+            "Write and enable scx-profile.service so the selected scheduler\n"
+            "and profile are applied at boot."
+        )
+        self.boot_button.clicked.connect(self.set_boot)
+
+        self.boot_off_button = QPushButton("Disable boot")
+        self.boot_off_button.setToolTip("Disable and remove scx-profile.service")
+        self.boot_off_button.clicked.connect(self.disable_boot)
 
         self.apply_button = QPushButton(
             self._icon("dialog-ok-apply", QStyle.StandardPixmap.SP_DialogApplyButton), "Apply"
@@ -229,6 +388,8 @@ class Configurator(QWidget):
         button_row = QHBoxLayout()
         button_row.setSpacing(6)
         button_row.addWidget(self.stop_button)
+        button_row.addWidget(self.boot_button)
+        button_row.addWidget(self.boot_off_button)
         button_row.addStretch(1)
         button_row.addWidget(self.apply_button)
 
@@ -236,6 +397,7 @@ class Configurator(QWidget):
         layout.setSpacing(9)
         layout.addWidget(box)
         layout.addLayout(status_row)
+        layout.addWidget(self.boot_label)
         layout.addWidget(self.message_label)
         layout.addLayout(button_row)
 
@@ -267,6 +429,7 @@ class Configurator(QWidget):
     def reload(self):
         self.apply_button.setEnabled(True)
         self.stop_button.setEnabled(True)
+        self._refresh_boot()
 
         try:
             running, text = self.client.status()
@@ -342,24 +505,26 @@ class Configurator(QWidget):
         detail = Scxctl._message(result) or "unknown error"
         self._message(f"scxctl {verb} failed: {detail}", error=True)
 
-    def apply(self):
-        scheduler = self.scheduler_combo.currentText().strip()
-        if not scheduler:
-            self._message("Select a scheduler first.", error=True)
-            return
-
+    def _selector(self):
         mode = self.mode_combo.currentText().strip()
         args = self.args_edit.text().strip()
 
         if mode == NO_MODE:
             mode = ""
 
-        if mode and (not args or args == self._mode_args.get(mode, "")):
-            selector = ["--mode", mode]
-        elif args:
-            selector = ["--args", args]
-        else:
-            selector = []
+        if mode and mode in self._mode_args and (not args or args == self._mode_args[mode]):
+            return [f"--mode={mode}"]
+        if args:
+            return [f"--args={args}"]
+        return []
+
+    def apply(self):
+        scheduler = self.scheduler_combo.currentText().strip()
+        if not scheduler:
+            self._message("Select a scheduler first.", error=True)
+            return
+
+        selector = self._selector()
 
         verbs = ("switch", "start") if self._running else ("start", "switch")
         past = {"start": "Started", "switch": "Switched to"}
@@ -396,6 +561,50 @@ class Configurator(QWidget):
             self._refresh_status()
         else:
             self._failed("stop", result)
+
+    def set_boot(self):
+        scheduler = self.scheduler_combo.currentText().strip()
+        if not scheduler:
+            self._message("Select a scheduler first.", error=True)
+            return
+
+        args = self.args_edit.text().strip()
+        try:
+            install_boot_unit(boot_unit_text(scheduler, args))
+        except (FileNotFoundError, subprocess.TimeoutExpired, ScxctlError, OSError) as exc:
+            self._message(f"Could not set the boot profile: {exc}", error=True)
+            return
+
+        target = f"scx_{scheduler}"
+        if args:
+            target += f" --args={args}"
+        self._message(f"Boot profile set: {target}")
+        self._refresh_boot()
+        self._refresh_status()
+
+    def disable_boot(self):
+        try:
+            remove_boot_unit()
+        except (FileNotFoundError, subprocess.TimeoutExpired, ScxctlError, OSError) as exc:
+            self._message(f"Could not disable the boot profile: {exc}", error=True)
+            return
+
+        self._message("Boot profile disabled")
+        self._refresh_boot()
+        self._refresh_status()
+
+    def _refresh_boot(self):
+        try:
+            text = BOOT_UNIT_FILE.read_text(encoding="utf-8")
+        except OSError:
+            self.boot_label.setText("At boot: not configured")
+            return
+
+        match = re.search(r"^ExecStart=(.+)$", text, re.M)
+        if match:
+            self.boot_label.setText(f"At boot: {match.group(1)}")
+        else:
+            self.boot_label.setText("At boot: configured")
 
 
 def main():
